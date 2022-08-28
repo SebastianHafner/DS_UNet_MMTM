@@ -1,4 +1,2 @@
 _BASE_: "base.yaml"
 DEBUG: True
-DATASET:
-  INCLUDE_SPACENET7: False
