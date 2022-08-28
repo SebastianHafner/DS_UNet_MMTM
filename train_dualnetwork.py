@@ -33,8 +33,6 @@ def run_training(cfg):
 
     sar_criterion = loss_functions.get_criterion(cfg.MODEL.LOSS_TYPE)
     optical_criterion = loss_functions.get_criterion(cfg.MODEL.LOSS_TYPE)
-    fusion_criterion = loss_functions.get_criterion(cfg.MODEL.LOSS_TYPE)
-    consistency_criterion = loss_functions.get_criterion(cfg.CONSISTENCY_TRAINER.CONSISTENCY_LOSS_TYPE)
 
     # reset the generators
     dataset = datasets.UrbanExtractionDataset(cfg=cfg, dataset='training')
@@ -61,58 +59,26 @@ def run_training(cfg):
         print(f'Starting epoch {epoch}/{epochs}.')
 
         start = timeit.default_timer()
-        sar_loss_set, optical_loss_set, fusion_loss_set = [], [], []
-        supervised_loss_set, consistency_loss_set, loss_set = [], [], []
-        n_labeled, n_notlabeled = 0, 0
+        sar_loss_set, optical_loss_set, loss_set = [], [], []
 
         for i, batch in enumerate(dataloader):
 
             net.train()
             optimizer.zero_grad()
 
-            x_fusion = batch['x'].to(device)
+            x_sar = batch['x_sar'].to(device)
+            x_optical = batch['x_optical'].to(device)
             y_gts = batch['y'].to(device)
-            is_labeled = batch['is_labeled']
-            y_gts = y_gts[is_labeled]
 
-            sar_logits, optical_logits, fusion_logits = net(x_fusion)
+            sar_logits, optical_logits = net(x_sar, x_optical)
 
-            supervised_loss, consistency_loss = None, None
+            sar_loss = sar_criterion(sar_logits, y_gts)
+            sar_loss_set.append(sar_loss.item())
 
-            # supervised loss
-            if is_labeled.any():
-                sar_loss = sar_criterion(sar_logits[is_labeled], y_gts)
-                sar_loss_set.append(sar_loss.item())
+            optical_loss = optical_criterion(optical_logits, y_gts)
+            optical_loss_set.append(optical_loss.item())
 
-                optical_loss = optical_criterion(optical_logits[is_labeled], y_gts)
-                optical_loss_set.append(optical_loss.item())
-
-                fusion_loss = fusion_criterion(fusion_logits[is_labeled], y_gts)
-                fusion_loss_set.append(fusion_loss.item())
-                n_labeled += torch.sum(is_labeled).item()
-
-                supervised_loss = sar_loss + optical_loss + fusion_loss
-                supervised_loss_set.append(supervised_loss.item())
-
-            # consistency loss for semi-supervised training
-            if not is_labeled.all():
-                not_labeled = torch.logical_not(is_labeled)
-                n_notlabeled += torch.sum(not_labeled).item()
-
-                sar_probs = torch.sigmoid(sar_logits)
-                sar_probs = (sar_probs > 0.5).float() if cfg.CONSISTENCY_TRAINER.APPLY_THRESHOLD else sar_probs
-
-                consistency_loss = consistency_criterion(optical_logits[not_labeled,], sar_probs[not_labeled, ])
-                consistency_loss = cfg.CONSISTENCY_TRAINER.LOSS_FACTOR * consistency_loss
-                consistency_loss_set.append(consistency_loss.item())
-
-            if supervised_loss is None and consistency_loss is not None:
-                loss = consistency_loss
-            elif supervised_loss is not None and consistency_loss is not None:
-                loss = supervised_loss + consistency_loss
-            else:
-                loss = supervised_loss
-
+            loss = sar_loss + optical_loss
             loss_set.append(loss.item())
             loss.backward()
             optimizer.step()
@@ -129,23 +95,17 @@ def run_training(cfg):
 
                 # logging
                 time = timeit.default_timer() - start
-                labeled_percentage = n_labeled / (n_labeled + n_notlabeled) * 100
+
                 wandb.log({
                     'sar_loss': np.mean(sar_loss_set),
                     'optical_loss': np.mean(optical_loss_set),
-                    'fusion_loss': np.mean(fusion_loss_set),
-                    'supervised_loss': np.mean(supervised_loss_set),
-                    'consistency_loss': np.mean(consistency_loss_set) if consistency_loss_set else 0,
-                    'loss_set': np.mean(loss_set),
-                    'labeled_percentage': labeled_percentage,
+                    'loss': np.mean(loss_set),
                     'time': time,
                     'step': global_step,
                     'epoch': epoch_float,
                 })
                 start = timeit.default_timer()
-                sar_loss_set, optical_loss_set, fusion_loss_set = [], [], []
-                supervised_loss_set, consistency_loss_set, loss_set = [], [], []
-                n_labeled, n_notlabeled = 0, 0
+                sar_loss_set, optical_loss_set, loss_set = [], [], []
 
             if cfg.DEBUG:
                 break

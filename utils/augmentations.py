@@ -28,39 +28,44 @@ def compose_transformations(cfg):
 
 class Numpy2Torch(object):
     def __call__(self, args):
-        img, label = args
-        img_tensor = TF.to_tensor(img)
+        img_sar, img_optical, label = args
+        img_sar_tensor = TF.to_tensor(img_sar)
+        img_optical_tensor = TF.to_tensor(img_optical)
         label_tensor = TF.to_tensor(label)
-        return img_tensor, label_tensor
+        return img_sar_tensor, img_optical_tensor, label_tensor
 
 
 class RandomFlip(object):
     def __call__(self, args):
-        img, label = args
+        img_sar, img_optical, label = args
         horizontal_flip = np.random.choice([True, False])
         vertical_flip = np.random.choice([True, False])
 
         if horizontal_flip:
-            img = np.flip(img, axis=1)
+            img_sar = np.flip(img_sar, axis=1)
+            img_optical = np.flip(img_optical,axis=1)
             label = np.flip(label, axis=1)
 
         if vertical_flip:
-            img = np.flip(img, axis=0)
+            img_sar = np.flip(img_sar, axis=0)
+            img_optical = np.flip(img_optical, axis=0)
             label = np.flip(label, axis=0)
 
-        img = img.copy()
+        img_sar = img_sar.copy()
+        img_optical = img_optical.copy()
         label = label.copy()
 
-        return img, label
+        return img_sar, img_optical, label
 
 
 class RandomRotate(object):
     def __call__(self, args):
-        img, label = args
-        k = np.random.randint(1, 4) # number of 90 degree rotations
-        img = np.rot90(img, k, axes=(0, 1)).copy()
+        img_sar, img_optical, label = args
+        k = np.random.randint(1, 4)  # number of 90 degree rotations
+        img_sar = np.rot90(img_sar, k, axes=(0, 1)).copy()
+        img_optical = np.rot90(img_optical, k, axes=(0, 1)).copy()
         label = np.rot90(label, k, axes=(0, 1)).copy()
-        return img, label
+        return img_sar, img_optical, label
 
 
 class ColorShift(object):
@@ -69,10 +74,10 @@ class ColorShift(object):
         self.max_factor = max_factor
 
     def __call__(self, args):
-        img, label = args
-        factors = np.random.uniform(self.min_factor, self.max_factor, img.shape[-1])
-        img_rescaled = np.clip(img * factors[np.newaxis, np.newaxis, :], 0, 1).astype(np.float32)
-        return img_rescaled, label
+        img_sar, img_optical, label = args
+        factors = np.random.uniform(self.min_factor, self.max_factor, img_optical.shape[-1])
+        img_optical_rescaled = np.clip(img_optical * factors[np.newaxis, np.newaxis, :], 0, 1).astype(np.float32)
+        return img_sar, img_optical_rescaled, label
 
 
 class GammaCorrection(object):
@@ -82,10 +87,10 @@ class GammaCorrection(object):
         self.max_gamma = max_gamma
 
     def __call__(self, args):
-        img, label = args
-        gamma = np.random.uniform(self.min_gamma, self.max_gamma, img.shape[-1])
-        img_gamma_corrected = np.clip(np.power(img,gamma[np.newaxis, np.newaxis, :]), 0, 1).astype(np.float32)
-        return img_gamma_corrected, label
+        img_sar, img_optical, label = args
+        gamma = np.random.uniform(self.min_gamma, self.max_gamma, img_optical.shape[-1])
+        img_optical_gamma = np.clip(np.power(img_optical, gamma[np.newaxis, np.newaxis, :]), 0, 1).astype(np.float32)
+        return img_sar, img_optical_gamma, label
 
 
 class ImageCrop(object):
@@ -93,10 +98,11 @@ class ImageCrop(object):
         self.crop_size = crop_size
 
     def __call__(self, args):
-        img, label = args
-        m, n, _ = img.shape
+        img_sar, img_optical, label = args
+        m, n, _ = img_sar.shape
         i = 0 if m == self.crop_size else np.random.randint(0, m - self.crop_size)
         j = 0 if n == self.crop_size else np.random.randint(0, n - self.crop_size)
-        img_crop = img[i:i + self.crop_size, j:j + self.crop_size, ]
+        img_sar_crop = img_sar[i:i + self.crop_size, j:j + self.crop_size, ]
+        img_optical_crop = img_optical[i:i + self.crop_size, j:j + self.crop_size, ]
         label_crop = label[i:i + self.crop_size, j:j + self.crop_size, ]
-        return img_crop, label_crop
+        return img_sar_crop, img_optical_crop, label_crop

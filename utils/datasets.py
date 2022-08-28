@@ -56,16 +56,12 @@ class AbstractUrbanExtractionDataset(torch.utils.data.Dataset):
 # dataset for urban extraction with building footprints
 class UrbanExtractionDataset(AbstractUrbanExtractionDataset):
 
-    def __init__(self, cfg, dataset: str, include_projection: bool = False, no_augmentations: bool = False,
-                 include_unlabeled: bool = True):
+    def __init__(self, cfg, dataset: str, include_projection: bool = False, no_augmentations: bool = False):
         super().__init__(cfg)
 
         self.dataset = dataset
         if dataset == 'training':
             self.sites = list(cfg.DATASET.TRAINING)
-            # using parameter include_unlabeled to overwrite config
-            if include_unlabeled and cfg.DATALOADER.INCLUDE_UNLABELED:
-                self.sites += cfg.DATASET.UNLABELED
         elif dataset == 'validation':
             self.sites = list(cfg.DATASET.VALIDATION)
         else:  # used to load only 1 city passed as dataset
@@ -82,51 +78,30 @@ class UrbanExtractionDataset(AbstractUrbanExtractionDataset):
             samples_file = self.root_path / site / 'samples.json'
             metadata = geofiles.load_json(samples_file)
             samples = metadata['samples']
-            # making sure unlabeled data is not used as labeled when labels exist
-            if include_unlabeled and site in cfg.DATASET.UNLABELED:
-                for sample in samples:
-                    sample['is_labeled'] = False
             self.samples += samples
 
         self.length = len(self.samples)
-        self.n_labeled = len([s for s in self.samples if s['is_labeled']])
-
         self.crop_size = cfg.AUGMENTATION.CROP_SIZE
-
         self.include_projection = include_projection
 
     def __getitem__(self, index):
 
         # loading metadata of sample
         sample = self.samples[index]
-        is_labeled = sample['is_labeled']
         patch_id = sample['patch_id']
         site = sample['site']
-        img_weight = np.float(sample['img_weight'])
-        mode = self.cfg.DATALOADER.MODE
 
-        if mode == 'optical':
-            img, geotransform, crs = self._get_sentinel2_data(site, patch_id)
-        elif mode == 'sar':
-            img, geotransform, crs = self._get_sentinel1_data(site, patch_id)
-        else:
-            s1_img, geotransform, crs = self._get_sentinel1_data(site, patch_id)
-            s2_img, _, _ = self._get_sentinel2_data(site, patch_id)
-            img = np.concatenate([s1_img, s2_img], axis=-1)
+        img_sar, *_ = self._get_sentinel1_data(site, patch_id)
+        img_optical, *_ = self._get_sentinel2_data(site, patch_id)
+        label, geotransform, crs = self._get_label_data(site, patch_id)
 
-        if is_labeled:
-            label, _, _ = self._get_label_data(site, patch_id)
-        else:
-            label = np.zeros((self.crop_size, self.crop_size, 1), dtype=np.float32)
-
-        img, label = self.transform((img, label))
+        x_sar, x_optical, label = self.transform((img_sar, img_optical, label))
         item = {
-            'x': img,
+            'x_sar': x_sar,
+            'x_optical': x_optical,
             'y': label,
             'site': site,
             'patch_id': patch_id,
-            'is_labeled': sample['is_labeled'],
-            'image_weight': img_weight,
         }
 
         if self.include_projection:
@@ -139,8 +114,7 @@ class UrbanExtractionDataset(AbstractUrbanExtractionDataset):
         return self.length
 
     def __str__(self):
-        labeled_perc = self.n_labeled / self.length * 100
-        return f'Dataset with {self.length} samples ({labeled_perc:.1f} % labeled) across {len(self.sites)} sites.'
+        return f'Dataset with {self.length} samples across {len(self.sites)} sites.'
 
 
 class AbstractSpaceNet7Dataset(torch.utils.data.Dataset):
@@ -229,22 +203,14 @@ class SpaceNet7Dataset(AbstractSpaceNet7Dataset):
         aoi_id = sample['aoi_id']
 
         # loading images
-        mode = self.cfg.DATALOADER.MODE
-        if mode == 'optical':
-            img, _, _ = self._get_sentinel2_data(aoi_id)
-        elif mode == 'sar':
-            img, _, _ = self._get_sentinel1_data(aoi_id)
-        else:  # fusion baby!!!
-            s1_img, _, _ = self._get_sentinel1_data(aoi_id)
-            s2_img, _, _ = self._get_sentinel2_data(aoi_id)
-
-            img = np.concatenate([s1_img, s2_img], axis=-1)
-
+        img_sar, *_ = self._get_sentinel1_data(aoi_id)
+        img_optical, *_ = self._get_sentinel2_data(aoi_id)
         label, geotransform, crs = self._get_label_data(aoi_id)
-        img, label = self.transform((img, label))
+        x_sar, x_optical, label = self.transform((img_sar, img_optical, label))
 
         item = {
-            'x': img,
+            'x_sar': x_sar,
+            'x_optical': x_optical,
             'y': label,
             'aoi_id': aoi_id,
             'country': sample['country'],

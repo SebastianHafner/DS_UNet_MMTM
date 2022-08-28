@@ -1,8 +1,0 @@
-_BASE_: "base.yaml"
-DEBUG: False
-
-MODEL:
-  IN_CHANNELS: 10
-
-DATALOADER:
-  MODE: 'optical'

@@ -10,7 +10,14 @@ from utils import experiment_manager
 
 
 def create_network(cfg):
-    return DualStreamUNet(cfg) if cfg.MODEL.TYPE == 'dualstreamunet' else UNet(cfg)
+    if cfg.MODEL.TYPE == 'ds_unet':
+        return DualStreamUNet(cfg)
+    elif cfg.MODEL.TYPE == 'ds_unet_mmtmencoder':
+        return DualStreamUNet_MMTMEncoder(cfg)
+    elif cfg.MODEL.TYPE == 'ds_unet_mmtmdecoder':
+        return DualStreamUNet_MMTMDecoder(cfg)
+    else:
+        return UNet(cfg)
 
 
 def save_checkpoint(network, optimizer, epoch: int, step: int, cfg: experiment_manager.CfgNode):
@@ -36,6 +43,141 @@ def load_checkpoint(epoch: int, cfg: experiment_manager.CfgNode, device):
     optimizer.load_state_dict(checkpoint['optimizer'])
 
     return net, optimizer, checkpoint['step']
+
+
+def init_weights(m):
+    print(m)
+    if type(m) == nn.Linear:
+        print(m.weight)
+    else:
+        print('error')
+
+
+class DualStreamUNet(nn.Module):
+
+    def __init__(self, cfg):
+        super(DualStreamUNet, self).__init__()
+        self._cfg = cfg
+        out = cfg.MODEL.OUT_CHANNELS
+        topology = cfg.MODEL.TOPOLOGY
+
+        # sentinel-1 sar unet stream
+        self.inc_sar = InConv(len(cfg.DATALOADER.SENTINEL1_BANDS), topology[0], DoubleConv)
+        self.encoder_sar = Encoder(cfg)
+        self.decoder_sar = Decoder(cfg)
+        self.outc_sar = OutConv(topology[0], out)
+
+        # sentinel-2 optical unet stream
+        self.inc_optical = InConv(len(cfg.DATALOADER.SENTINEL2_BANDS), topology[0], DoubleConv)
+        self.encoder_optical = Encoder(cfg)
+        self.decoder_optical = Decoder(cfg)
+        self.outc_optical = OutConv(topology[0], out)
+
+
+    def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
+        # sar
+        x_sar = self.inc_sar(x_sar)
+        features_sar = self.encoder_sar(x_sar)
+        x_sar = self.decoder_sar(features_sar)
+        out_sar = self.outc_sar(x_sar)
+
+        # optical
+        x_optical = self.inc_optical(x_optical)
+        features_optical = self.encoder_optical(x_optical)
+        x_optical = self.decoder_optical(features_optical)
+        out_optical = self.outc_optical(x_optical)
+
+        return out_sar, out_optical
+
+
+class DualStreamUNet_MMTMEncoder(nn.Module):
+
+    def __init__(self, cfg):
+        super(DualStreamUNet_MMTMEncoder, self).__init__()
+        self._cfg = cfg
+        out = cfg.MODEL.OUT_CHANNELS
+        topology = cfg.MODEL.TOPOLOGY
+
+        # sentinel-1 sar unet stream
+        self.inc_sar = InConv(len(cfg.DATALOADER.SENTINEL1_BANDS), topology[0], DoubleConv)
+        self.decoder_sar = Decoder(cfg)
+        self.outc_sar = OutConv(topology[0], out)
+
+        # sentinel-2 optical unet stream
+        self.inc_optical = InConv(len(cfg.DATALOADER.SENTINEL2_BANDS), topology[0], DoubleConv)
+        self.decoder_optical = Decoder(cfg)
+        self.outc_optical = OutConv(topology[0], out)
+
+        self.mmtm_encoder = MMTMEncoder(cfg)
+
+    def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
+        # in convolutions
+        x_sar = self.inc_sar(x_sar)
+        x_optical = self.inc_optical(x_optical)
+
+        # encoding with mmtm
+        features_sar, features_optical = self.mmtm_encoder(x_sar, x_optical)
+
+        # decoding
+        x_sar = self.decoder_sar(features_sar)
+        x_optical = self.decoder_optical(features_optical)
+
+        # out convolutions
+        out_sar = self.outc_sar(x_sar)
+        out_optical = self.outc_optical(x_optical)
+
+        return out_sar, out_optical
+
+
+class DualStreamUNet_MMTMDecoder(nn.Module):
+
+    def __init__(self, cfg):
+        super(DualStreamUNet_MMTMDecoder, self).__init__()
+        self._cfg = cfg
+        out = cfg.MODEL.OUT_CHANNELS
+        topology = cfg.MODEL.TOPOLOGY
+
+        # sentinel-1 sar unet stream
+        self.inc_sar = InConv(len(cfg.DATALOADER.SENTINEL1_BANDS), topology[0], DoubleConv)
+        self.encoder_sar = Encoder(cfg)
+        self.decoder_sar = Decoder(cfg)
+        self.outc_sar = OutConv(topology[0], out)
+
+        # sentinel-2 optical unet stream
+        self.inc_optical = InConv(len(cfg.DATALOADER.SENTINEL2_BANDS), topology[0], DoubleConv)
+        self.encoder_optical = Encoder(cfg)
+        self.decoder_optical = Decoder(cfg)
+        self.outc_optical = OutConv(topology[0], out)
+
+        self.mmtm_units = []
+        mmtm = MMTM(topology[-1], topology[-1], 1)
+        self.mmtm_units.append(mmtm)
+        for n_channels in topology[::-1]:
+            mmtm = MMTM(n_channels, n_channels, 1)
+            self.mmtm_units.append(mmtm)
+
+    def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
+        # sar encoding
+        x_sar = self.inc_sar(x_sar)
+        features_sar = self.encoder_sar(x_sar)
+
+        # optical encoding
+        x_optical = self.inc_optical(x_optical)
+        features_optical = self.encoder_optical(x_optical)
+
+        # mmtm
+        for i, (mmtm, feature_sar, feature_optical) in enumerate(zip(self.mmtm_units, features_sar, features_optical)):
+            feature_sar_mmtm, feature_optical_mmtm = mmtm(feature_sar, feature_optical)
+            features_sar[i] = feature_sar_mmtm
+            features_optical[i] = feature_optical_mmtm
+
+        x_sar = self.decoder_sar(features_sar)
+        out_sar = self.outc_sar(x_sar)
+
+        x_optical = self.decoder_sar(features_optical)
+        out_optical = self.outc_sar(x_optical)
+
+        return out_sar, out_optical
 
 
 class UNet(nn.Module):
@@ -112,65 +254,174 @@ class UNet(nn.Module):
         return out
 
 
-class DualStreamUNet(nn.Module):
-
+class Encoder(nn.Module):
     def __init__(self, cfg):
-        super(DualStreamUNet, self).__init__()
-        self._cfg = cfg
-        out = cfg.MODEL.OUT_CHANNELS
+        super(Encoder, self).__init__()
+
+        self.cfg = cfg
         topology = cfg.MODEL.TOPOLOGY
-        out_dim = topology[0]
 
-        # sentinel-1 sar unet stream
-        sar_in = len(cfg.DATALOADER.SENTINEL1_BANDS)
-        self.sar_stream = UNet(cfg, n_channels=sar_in, n_classes=out, topology=topology, enable_outc=False)
-        self.sar_in = sar_in
-        self.sar_out_conv = OutConv(out_dim, out)
+        # Variable scale
+        down_topo = topology
+        down_dict = OrderedDict()
+        n_layers = len(down_topo)
 
-        # sentinel-2 optical unet stream
-        optical_in = len(cfg.DATALOADER.SENTINEL2_BANDS)
-        self.optical_stream = UNet(cfg, n_channels=optical_in, n_classes=out, topology=topology, enable_outc=False)
-        self.optical_in = optical_in
-        self.optical_out_conv = OutConv(out_dim, out)
+        # Downward layers
+        for idx in range(n_layers):
+            is_not_last_layer = idx != n_layers - 1
+            in_dim = down_topo[idx]
+            out_dim = down_topo[idx + 1] if is_not_last_layer else down_topo[idx]  # last layer
+            layer = Down(in_dim, out_dim, DoubleConv)
+            down_dict[f'down{idx + 1}'] = layer
+        self.down_seq = nn.ModuleDict(down_dict)
 
-        # out block combining unet outputs
-        fusion_out_dim = 2 * out_dim
-        self.fusion_out_conv = OutConv(fusion_out_dim, out)
+    def forward(self, x1: torch.Tensor) -> list:
 
-    def forward(self, x_fusion):
+        inputs = [x1]
+        # Downward U:
+        for layer in self.down_seq.values():
+            out = layer(inputs[-1])
+            inputs.append(out)
 
-        # sar
-        x_sar = x_fusion[:, :self.sar_in, ]
-        features_sar = self.sar_stream(x_sar)
+        inputs.reverse()
+        return inputs
 
-        # optical
-        x_optical = x_fusion[:, self.sar_in:, ]
-        features_optical = self.optical_stream(x_optical)
 
-        features_fusion = torch.cat((features_sar, features_optical), dim=1)
-        logits_fusion = self.fusion_out_conv(features_fusion)
+class MMTMEncoder(nn.Module):
+    def __init__(self, cfg):
+        super(MMTMEncoder, self).__init__()
 
-        if self.training:
-            logits_sar = self.sar_out_conv(features_sar)
-            logits_optical = self.optical_out_conv(features_optical)
+        self.cfg = cfg
+        topology = cfg.MODEL.TOPOLOGY
 
-            return logits_sar, logits_optical, logits_fusion
+        # Variable scale
+        down_topo = topology
+        down_dict_sar, down_dict_optical, mmtm_dict = OrderedDict(), OrderedDict(), OrderedDict()
+        n_layers = len(down_topo)
 
-        else:
-            return logits_fusion
+        # Downward layers
+        for idx in range(n_layers):
+            is_not_last_layer = idx != n_layers - 1
+            in_dim = down_topo[idx]
 
-    def fusion_features(self, x_fusion):
+            # mmtm unit
+            mmtm = MMTM(in_dim, in_dim, 1)
+            mmtm_dict[f'mmtm{idx + 1}'] = mmtm
 
-        # sar
-        x_sar = x_fusion[:, :self.sar_in, ]
-        features_sar = self.sar_stream(x_sar)
+            # down units
+            out_dim = down_topo[idx + 1] if is_not_last_layer else down_topo[idx]  # last layer
+            down_sar = Down(in_dim, out_dim, DoubleConv)
+            down_dict_sar[f'down{idx + 1}_sar'] = down_sar
+            down_optical = Down(in_dim, out_dim, DoubleConv)
+            down_dict_optical[f'down{idx + 1}_optical'] = down_optical
 
-        # optical
-        x_optical = x_fusion[:, self.sar_in:, ]
-        features_optical = self.optical_stream(x_optical)
+        self.down_seq_sar = nn.ModuleDict(down_dict_sar)
+        self.down_seq_optical = nn.ModuleDict(down_dict_optical)
+        self.mmtm_seq = nn.ModuleDict(mmtm_dict)
 
-        features_fusion = torch.cat((features_sar, features_optical), dim=1)
-        return features_fusion
+    def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor) -> tuple:
+
+        inputs_sar, inputs_optical = [x_sar], [x_optical]
+        # Downward U:
+        for mmtm, down_sar, down_optical in zip(self.mmtm_seq.values(), self.down_seq_sar.values(),
+                                                self.down_seq_optical.values()):
+
+            features_sar, features_optical = inputs_sar[-1], inputs_optical[-1]
+            features_sar_mmtm, features_optical_mmtm = mmtm(features_sar, features_optical)
+
+            # sar
+            out_sar = down_sar(features_sar_mmtm)
+            inputs_sar.append(out_sar)
+            # optical
+            out_optical = down_optical(features_optical_mmtm)
+            inputs_optical.append(out_optical)
+
+        inputs_sar.reverse()
+        inputs_optical.reverse()
+
+        return inputs_sar, inputs_optical
+
+
+class MMTM(nn.Module):
+    def __init__(self, dim_sar, dim_optical, ratio):
+        super(MMTM, self).__init__()
+        dim = dim_sar + dim_optical
+        dim_out = int(2 * dim / ratio)
+        self.fc_squeeze = nn.Linear(dim, dim_out)
+
+        self.fc_sar = nn.Linear(dim_out, dim_sar)
+        self.fc_optical = nn.Linear(dim_out, dim_optical)
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+
+        # initialize
+        # with torch.no_grad():
+        #     self.fc_squeeze.apply(init_weights)
+        #     self.fc_sar.apply(init_weights)
+        #     self.fc_optical.apply(init_weights)
+
+    def forward(self, sar, optical):
+        squeeze_array = []
+        for tensor in [sar, optical]:
+            tview = tensor.view(tensor.shape[:2] + (-1,))
+            squeeze_array.append(torch.mean(tview, dim=-1))
+        squeeze = torch.cat(squeeze_array, 1)
+
+        excitation = self.fc_squeeze(squeeze)
+        excitation = self.relu(excitation)
+
+        sar_out = self.fc_sar(excitation)
+        optical_out = self.fc_optical(excitation)
+
+        sar_out = self.sigmoid(sar_out)
+        optical_out = self.sigmoid(optical_out)
+
+        dim_diff = len(sar.shape) - len(sar_out.shape)
+        sar_out = sar_out.view(sar_out.shape + (1,) * dim_diff)
+
+        dim_diff = len(optical.shape) - len(optical_out.shape)
+        optical_out = optical_out.view(optical_out.shape + (1,) * dim_diff)
+
+        return sar * sar_out, optical * optical_out
+
+
+class Decoder(nn.Module):
+    def __init__(self, cfg: experiment_manager.CfgNode, topology: list = None):
+        super(Decoder, self).__init__()
+        self.cfg = cfg
+
+        topology = cfg.MODEL.TOPOLOGY if topology is None else topology
+
+        # Variable scale
+        n_layers = len(topology)
+        up_topo = [topology[0]]  # topography upwards
+        up_dict = OrderedDict()
+
+        for idx in range(n_layers):
+            is_not_last_layer = idx != n_layers - 1
+            out_dim = topology[idx + 1] if is_not_last_layer else topology[idx]  # last layer
+            up_topo.append(out_dim)
+
+        # Upward layers
+        for idx in reversed(range(n_layers)):
+            is_not_last_layer = idx != 0
+            x1_idx = idx
+            x2_idx = idx - 1 if is_not_last_layer else idx
+            in_dim = up_topo[x1_idx] * 2
+            out_dim = up_topo[x2_idx]
+            layer = Up(in_dim, out_dim, DoubleConv)
+            up_dict[f'up{idx + 1}'] = layer
+
+        self.up_seq = nn.ModuleDict(up_dict)
+
+    def forward(self, features: list) -> torch.Tensor:
+
+        x1 = features.pop(0)
+        for idx, layer in enumerate(self.up_seq.values()):
+            x2 = features[idx]
+            x1 = layer(x1, x2)  # x1 for next up layer
+
+        return x1
 
 
 # sub-parts of the U-Net model
