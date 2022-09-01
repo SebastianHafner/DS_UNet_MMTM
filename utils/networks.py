@@ -13,9 +13,9 @@ def create_network(cfg):
     if cfg.MODEL.TYPE == 'ds_unet':
         return DualStreamUNet(cfg)
     elif cfg.MODEL.TYPE == 'ds_unet_mmtmencoder':
-        return DualStreamUNet_MMTMEncoder(cfg)
+        return DualStreamUNetMMTMEncoder(cfg)
     elif cfg.MODEL.TYPE == 'ds_unet_mmtmdecoder':
-        return DualStreamUNet_MMTMDecoder(cfg)
+        return DualStreamUNetMMTMDecoder(cfg)
     else:
         return UNet(cfg)
 
@@ -90,10 +90,10 @@ class DualStreamUNet(nn.Module):
         return out_sar, out_optical
 
 
-class DualStreamUNet_MMTMEncoder(nn.Module):
+class DualStreamUNetMMTMEncoder(nn.Module):
 
     def __init__(self, cfg):
-        super(DualStreamUNet_MMTMEncoder, self).__init__()
+        super(DualStreamUNetMMTMEncoder, self).__init__()
         self._cfg = cfg
         out = cfg.MODEL.OUT_CHANNELS
         topology = cfg.MODEL.TOPOLOGY
@@ -109,6 +109,7 @@ class DualStreamUNet_MMTMEncoder(nn.Module):
         self.outc_optical = OutConv(topology[0], out)
 
         self.mmtm_encoder = MMTMEncoder(cfg)
+        self.mmtm_mode = 'fusion'
 
     def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
         # in convolutions
@@ -128,11 +129,30 @@ class DualStreamUNet_MMTMEncoder(nn.Module):
 
         return out_sar, out_optical
 
+    def compute_unimodal_features(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
+        # in convolutions
+        x_sar = self.inc_sar(x_sar)
+        x_optical = self.inc_optical(x_optical)
+        self.mmtm_encoder.compute_unimodal_features(x_sar, x_optical)
 
-class DualStreamUNet_MMTMDecoder(nn.Module):
+    def load_unimodal_features(self):
+        save_file = Path(self._cfg.PATHS.OUTPUT) / 'networks' /\
+                    f'{self._cfg.NAME}_checkpoint{self._cfg.INFERENCE_CHECKPOINT}.pt'
+        features = torch.load(save_file, map_location=lambda storage, location: 'cpu')
+        for name, mmtm in self.mmtm_encoder.mmtm_seq.items():
+            mmtm.average_sar_squeeze = features[f'{name}_sar']
+            mmtm.average_sar_squeeze = features[f'{name}_optical']
+
+    def set_mmtm_mode(self, new_mode: str):
+        self.mmtm_mode = new_mode
+        for mmtm_module in self.mmtm_encoder.mmtm_seq.values():
+            mmtm_module.set_mode(new_mode)
+
+
+class DualStreamUNetMMTMDecoder(nn.Module):
 
     def __init__(self, cfg):
-        super(DualStreamUNet_MMTMDecoder, self).__init__()
+        super(DualStreamUNetMMTMDecoder, self).__init__()
         self._cfg = cfg
         out = cfg.MODEL.OUT_CHANNELS
         topology = cfg.MODEL.TOPOLOGY
@@ -341,6 +361,14 @@ class MMTMEncoder(nn.Module):
 
         return inputs_sar, inputs_optical
 
+    def compute_unimodal_features(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
+
+        inputs_sar, inputs_optical = [x_sar], [x_optical]
+        for mmtm, down_sar, down_optical in zip(self.mmtm_seq.values(), self.down_seq_sar.values(),
+                                                self.down_seq_optical.values()):
+            features_sar, features_optical = inputs_sar[-1], inputs_optical[-1]
+            mmtm.compute_unimodal_average_squeeze(features_sar, features_optical)
+
 
 class MMTM(nn.Module):
     def __init__(self, dim_sar, dim_optical, ratio):
@@ -354,17 +382,23 @@ class MMTM(nn.Module):
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
 
-        # initialize
-        # with torch.no_grad():
-        #     self.fc_squeeze.apply(init_weights)
-        #     self.fc_sar.apply(init_weights)
-        #     self.fc_optical.apply(init_weights)
+        # for unimodal experiments
+        # https://discuss.pytorch.org/t/how-to-make-a-tensor-part-of-model-parameters/51037/6
+        self.average_sar_squeeze = nn.Parameter(torch.empty((1, dim_sar), requires_grad=False))
+        self.average_optical_squeeze = nn.Parameter(torch.empty((1, dim_optical), requires_grad=False))
+        self.average_n = 0
+        self.mode = 'fusion'
 
     def forward(self, sar, optical):
         squeeze_array = []
         for tensor in [sar, optical]:
             tview = tensor.view(tensor.shape[:2] + (-1,))
             squeeze_array.append(torch.mean(tview, dim=-1))
+        if self.mode == 'sar':
+            squeeze_array[-1] = self.average_optical_squeeze
+        if self.mode == 'optical':
+            squeeze_array[0] = self.average_sar_squeeze
+
         squeeze = torch.cat(squeeze_array, 1)
 
         excitation = self.fc_squeeze(squeeze)
@@ -383,6 +417,30 @@ class MMTM(nn.Module):
         optical_out = optical_out.view(optical_out.shape + (1,) * dim_diff)
 
         return sar * sar_out, optical * optical_out
+
+    def compute_unimodal_average_squeeze(self, sar: torch.Tensor, optical: torch.Tensor):
+
+        n_batch = sar.shape[0]
+
+        sar_tview = sar.view(sar.shape[:2] + (-1,))
+        sar_squeeze = torch.mean(sar_tview, dim=-1)
+        optical_tview = optical.view(optical.shape[:2] + (-1,))
+        optical_squeeze = torch.mean(optical_tview, dim=-1)
+
+        if self.average_n == 0:
+            self.average_sar_squeeze = torch.mean(sar_squeeze, dim=0).unsqueeze(0)
+            self.average_optical_squeeze = torch.mean(optical_squeeze, dim=0).unsqueeze(0)
+            self.average_n += n_batch
+        else:
+            total_batch_sar_squeeze = torch.sum(sar_squeeze, dim=0).unsqueeze(0)
+            self.average_sar_squeeze = (self.average_sar_squeeze * self.average_n + total_batch_sar_squeeze) /\
+                                       (self.average_n + n_batch)
+            total_batch_optical_squeeze = torch.sum(optical_squeeze, dim=0).unsqueeze(0)
+            self.average_optical_squeeze = (self.average_optical_squeeze * self.average_n +
+                                            total_batch_optical_squeeze) / (self.average_n + n_batch)
+
+    def set_mode(self, new_mode: str):
+        self.mode = new_mode
 
 
 class Decoder(nn.Module):
