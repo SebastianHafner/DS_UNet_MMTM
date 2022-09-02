@@ -2,11 +2,11 @@ import torch
 from torch.utils import data as torch_data
 import numpy as np
 import wandb
-from tqdm import tqdm
-from utils import datasets, metrics
+from utils import datasets, metrics, experiment_manager
 
 
-def model_evaluation(net, cfg, device, run_type: str, epoch: float, step: int, max_samples: int = None):
+def model_evaluation(net, cfg: experiment_manager.CfgNode, device: str, run_type: str, epoch: float, step: int,
+                     max_samples: int = None):
     net.to(device)
     net.eval()
 
@@ -65,67 +65,81 @@ def model_evaluation(net, cfg, device, run_type: str, epoch: float, step: int, m
                    })
 
 
-def model_testing(net, cfg, device, step, epoch):
+def model_testing(net, cfg: experiment_manager.CfgNode, device: str, step: int, epoch: float):
     net.to(device)
     net.eval()
 
+    thresholds = torch.linspace(0.5, 1, 1).to(device)
+    measurer = metrics.ConditionalUtilizationRate()
+    measurer_fusion = metrics.MultiThresholdMetric(thresholds, 'fusion')
+    measurer_sar_mm = metrics.MultiThresholdMetric(thresholds, 'sar_mm')
+    measurer_sar_um = metrics.MultiThresholdMetric(thresholds, 'sar_um')
+    measurer_optical_mm = metrics.MultiThresholdMetric(thresholds, 'optical_mm')
+    measurer_optical_um = metrics.MultiThresholdMetric(thresholds, 'optical_um')
+
     dataset = datasets.SpaceNet7Dataset(cfg)
 
-    y_true_dict = {'total': []}
-    y_pred_sar_dict = {'total': []}
-    y_pred_optical_dict = {'total': []}
-    y_pred_fusion_dict = {'total': []}
+    with torch.no_grad():
+        for item in dataset:
+            y = item['y'].to(device)
+            x_sar = item['x_sar'].to(device).unsqueeze(0)
+            x_optical = item['x_optical'].to(device).unsqueeze(0)
+
+            net.set_mmtm_mode('fusion')
+            out_sar_mm, out_optical_mm = net.forward(x_sar, x_optical)
+            pred_sar_mm, pred_optical_mm = torch.sigmoid(out_sar_mm).detach(), torch.sigmoid(out_optical_mm).detach()
+            measurer_sar_mm.add_sample(y, pred_sar_mm)
+            measurer_optical_mm.add_sample(y, pred_optical_mm)
+
+            pred_fusion = (pred_sar_mm + pred_optical_mm) / 2
+            measurer_fusion.add_sample(y, pred_fusion)
+
+            net.set_mmtm_mode('sar')
+            out_sar_um, _ = net.forward(x_sar, x_optical)
+            pred_sar_um = torch.sigmoid(out_sar_um).detach()
+            measurer_sar_um.add_sample(y, pred_sar_um)
+
+            net.set_mmtm_mode('optical')
+            out_optical_um, _ = net.forward(x_sar, x_optical)
+            pred_optical_um = torch.sigmoid(out_optical_um).detach()
+            measurer_optical_um.add_sample(y, pred_optical_um)
+
+        for measurer in [measurer_sar_mm, measurer_sar_um, measurer_optical_mm, measurer_optical_um, measurer_fusion]:
+            f1s = measurer.compute_f1()
+            precisions, recalls = measurer.precision, measurer.recall
+
+            # best f1 score for passed thresholds
+            f1 = f1s.max()
+            argmax_f1 = f1s.argmax()
+
+            precision = precisions[argmax_f1]
+            recall = recalls[argmax_f1]
+
+            wandb.log({f'test {measurer.name} F1': f1.item(),
+                       f'test {measurer.name} precision': precision.item(),
+                       f'test {measurer.name} recall': recall.item(),
+                       'step': step, 'epoch': epoch,
+                       })
+
+
+def compute_mmtm_features(net, cfg: experiment_manager.CfgNode, device: str, run_type: str):
+    net.to(device)
+    net.eval()
+
+    dataset = datasets.UrbanExtractionDataset(cfg, dataset=run_type, no_augmentations=True)
+    dataloader_kwargs = {
+        'batch_size': cfg.TRAINER.BATCH_SIZE,
+        'num_workers': 0 if cfg.DEBUG else cfg.DATALOADER.NUM_WORKER,
+        'shuffle': cfg.DATALOADER.SHUFFLE,
+        'drop_last': False,
+        'pin_memory': True,
+    }
+    dataloader = torch_data.DataLoader(dataset, **dataloader_kwargs)
 
     with torch.no_grad():
-        for index in range(len(dataset)):
-            sample = dataset.__getitem__(index)
-            x_sar = sample['x_sar'].to(device)
-            x_optical = sample['x_optical'].to(device)
-            y_true = sample['y'].to(device)
-            logits_sar, logits_optical = net(x_sar.unsqueeze(0), x_optical.unsqueeze(0))
-            y_pred_sar = torch.sigmoid(logits_sar).detach().cpu().numpy()
-            y_pred_optical = torch.sigmoid(logits_optical).detach().cpu().numpy()
-            y_pred_fusion = (y_pred_sar + y_pred_optical) / 2
-            y_true = y_true.detach().cpu().numpy().flatten()
+        for i, batch in enumerate(dataloader):
+            x_sar = batch['x_sar'].to(device)
+            x_optical = batch['x_optical'].to(device)
+            net.compute_unimodal_features(x_sar, x_optical)
 
-            y_pred_sar = (y_pred_sar > 0.5).flatten()
-            y_pred_optical = (y_pred_optical > 0.5).flatten()
-            y_pred_fusion = (y_pred_fusion > 0.5).flatten()
-
-            region = sample['region']
-            if region not in y_true_dict.keys():
-                y_true_dict[region] = [y_true]
-                y_pred_sar_dict[region] = [y_pred_sar]
-                y_pred_optical_dict[region] = [y_pred_optical]
-                y_pred_fusion_dict[region] = [y_pred_fusion]
-            else:
-                y_true_dict[region].append(y_true)
-                y_pred_sar_dict[region].append(y_pred_sar)
-                y_pred_optical_dict[region].append(y_pred_optical)
-                y_pred_fusion_dict[region].append(y_pred_fusion)
-
-            y_true_dict['total'].append(y_true)
-            y_pred_sar_dict['total'].append(y_pred_sar)
-            y_pred_optical_dict['total'].append(y_pred_optical)
-            y_pred_fusion_dict['total'].append(y_pred_fusion)
-
-    def evaluate_region(region_name: str, y_pred_dict: dict, name: str):
-        y_true_region = torch.Tensor(np.concatenate(y_true_dict[region_name])).flatten()
-        y_pred_region = torch.Tensor(np.concatenate(y_pred_dict[region_name])).flatten()
-        prec = metrics.precision(y_true_region, y_pred_region, dim=0).item()
-        rec = metrics.recall(y_true_region, y_pred_region, dim=0).item()
-        f1 = metrics.f1_score(y_true_region, y_pred_region, dim=0).item()
-
-        wandb.log({f'{region_name} {name} F1': f1,
-                   f'{region_name} {name} precision': prec,
-                   f'{region_name} {name} recall': rec,
-                   'step': step, 'epoch': epoch,
-                   })
-
-    for y_pred_dict, name in zip([y_pred_sar_dict, y_pred_optical_dict, y_pred_fusion_dict],
-                                 ['sar','optical', 'fusion']):
-        for region in dataset.regions['regions'].values():
-            evaluate_region(region, y_pred_dict, name)
-        evaluate_region('total', y_pred_dict, name)
-
-
+    return net

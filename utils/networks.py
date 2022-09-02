@@ -133,71 +133,16 @@ class DualStreamUNetMMTMEncoder(nn.Module):
         # in convolutions
         x_sar = self.inc_sar(x_sar)
         x_optical = self.inc_optical(x_optical)
-        self.mmtm_encoder.compute_unimodal_features(x_sar, x_optical)
+        self.mmtm_encoder.forward(x_sar, x_optical, compute_unimodal_mmtm_features=True)
 
-    def load_unimodal_features(self):
-        save_file = Path(self._cfg.PATHS.OUTPUT) / 'networks' /\
-                    f'{self._cfg.NAME}_checkpoint{self._cfg.INFERENCE_CHECKPOINT}.pt'
-        features = torch.load(save_file, map_location=lambda storage, location: 'cpu')
-        for name, mmtm in self.mmtm_encoder.mmtm_seq.items():
-            mmtm.average_sar_squeeze = features[f'{name}_sar']
-            mmtm.average_sar_squeeze = features[f'{name}_optical']
+    def reset_mmtm_features(self):
+        for mmtm in self.mmtm_encoder.mmtm_seq.values():
+            mmtm.reset_average_squeeze()
 
     def set_mmtm_mode(self, new_mode: str):
         self.mmtm_mode = new_mode
         for mmtm_module in self.mmtm_encoder.mmtm_seq.values():
             mmtm_module.set_mode(new_mode)
-
-
-class DualStreamUNetMMTMDecoder(nn.Module):
-
-    def __init__(self, cfg):
-        super(DualStreamUNetMMTMDecoder, self).__init__()
-        self._cfg = cfg
-        out = cfg.MODEL.OUT_CHANNELS
-        topology = cfg.MODEL.TOPOLOGY
-
-        # sentinel-1 sar unet stream
-        self.inc_sar = InConv(len(cfg.DATALOADER.SENTINEL1_BANDS), topology[0], DoubleConv)
-        self.encoder_sar = Encoder(cfg)
-        self.decoder_sar = Decoder(cfg)
-        self.outc_sar = OutConv(topology[0], out)
-
-        # sentinel-2 optical unet stream
-        self.inc_optical = InConv(len(cfg.DATALOADER.SENTINEL2_BANDS), topology[0], DoubleConv)
-        self.encoder_optical = Encoder(cfg)
-        self.decoder_optical = Decoder(cfg)
-        self.outc_optical = OutConv(topology[0], out)
-
-        self.mmtm_units = []
-        mmtm = MMTM(topology[-1], topology[-1], 1)
-        self.mmtm_units.append(mmtm)
-        for n_channels in topology[::-1]:
-            mmtm = MMTM(n_channels, n_channels, 1)
-            self.mmtm_units.append(mmtm)
-
-    def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
-        # sar encoding
-        x_sar = self.inc_sar(x_sar)
-        features_sar = self.encoder_sar(x_sar)
-
-        # optical encoding
-        x_optical = self.inc_optical(x_optical)
-        features_optical = self.encoder_optical(x_optical)
-
-        # mmtm
-        for i, (mmtm, feature_sar, feature_optical) in enumerate(zip(self.mmtm_units, features_sar, features_optical)):
-            feature_sar_mmtm, feature_optical_mmtm = mmtm(feature_sar, feature_optical)
-            features_sar[i] = feature_sar_mmtm
-            features_optical[i] = feature_optical_mmtm
-
-        x_sar = self.decoder_sar(features_sar)
-        out_sar = self.outc_sar(x_sar)
-
-        x_optical = self.decoder_sar(features_optical)
-        out_optical = self.outc_sar(x_optical)
-
-        return out_sar, out_optical
 
 
 class UNet(nn.Module):
@@ -339,7 +284,7 @@ class MMTMEncoder(nn.Module):
         self.down_seq_optical = nn.ModuleDict(down_dict_optical)
         self.mmtm_seq = nn.ModuleDict(mmtm_dict)
 
-    def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor) -> tuple:
+    def forward(self, x_sar: torch.Tensor, x_optical: torch.Tensor, compute_unimodal_mmtm_features: bool = False) -> tuple:
 
         inputs_sar, inputs_optical = [x_sar], [x_optical]
         # Downward U:
@@ -347,6 +292,10 @@ class MMTMEncoder(nn.Module):
                                                 self.down_seq_optical.values()):
 
             features_sar, features_optical = inputs_sar[-1], inputs_optical[-1]
+
+            if compute_unimodal_mmtm_features:
+                mmtm.compute_unimodal_average_squeeze(features_sar, features_optical)
+
             features_sar_mmtm, features_optical_mmtm = mmtm(features_sar, features_optical)
 
             # sar
@@ -361,21 +310,16 @@ class MMTMEncoder(nn.Module):
 
         return inputs_sar, inputs_optical
 
-    def compute_unimodal_features(self, x_sar: torch.Tensor, x_optical: torch.Tensor):
-
-        inputs_sar, inputs_optical = [x_sar], [x_optical]
-        for mmtm, down_sar, down_optical in zip(self.mmtm_seq.values(), self.down_seq_sar.values(),
-                                                self.down_seq_optical.values()):
-            features_sar, features_optical = inputs_sar[-1], inputs_optical[-1]
-            mmtm.compute_unimodal_average_squeeze(features_sar, features_optical)
-
 
 class MMTM(nn.Module):
     def __init__(self, dim_sar, dim_optical, ratio):
         super(MMTM, self).__init__()
-        dim = dim_sar + dim_optical
-        dim_out = int(2 * dim / ratio)
-        self.fc_squeeze = nn.Linear(dim, dim_out)
+        self.dim_sar = dim_sar
+        self.dim_optical = dim_optical
+        self.dim = dim_sar + dim_optical
+
+        dim_out = int(2 * self.dim / ratio)
+        self.fc_squeeze = nn.Linear(self.dim, dim_out)
 
         self.fc_sar = nn.Linear(dim_out, dim_sar)
         self.fc_optical = nn.Linear(dim_out, dim_optical)
@@ -384,8 +328,8 @@ class MMTM(nn.Module):
 
         # for unimodal experiments
         # https://discuss.pytorch.org/t/how-to-make-a-tensor-part-of-model-parameters/51037/6
-        self.average_sar_squeeze = nn.Parameter(torch.empty((1, dim_sar), requires_grad=False))
-        self.average_optical_squeeze = nn.Parameter(torch.empty((1, dim_optical), requires_grad=False))
+        self.average_sar_squeeze = nn.Parameter(torch.zeros((1, dim_sar), requires_grad=False))
+        self.average_optical_squeeze = nn.Parameter(torch.zeros((1, dim_optical), requires_grad=False))
         self.average_n = 0
         self.mode = 'fusion'
 
@@ -421,23 +365,26 @@ class MMTM(nn.Module):
     def compute_unimodal_average_squeeze(self, sar: torch.Tensor, optical: torch.Tensor):
 
         n_batch = sar.shape[0]
+        new_total_n = self.average_n + n_batch
 
-        sar_tview = sar.view(sar.shape[:2] + (-1,))
+        sar_tview = sar.detach().view(sar.shape[:2] + (-1,))
         sar_squeeze = torch.mean(sar_tview, dim=-1)
-        optical_tview = optical.view(optical.shape[:2] + (-1,))
-        optical_squeeze = torch.mean(optical_tview, dim=-1)
+        total_batch_sar_squeeze = torch.sum(sar_squeeze, dim=0).unsqueeze(0)
+        new_total_sar_squeeze = self.average_sar_squeeze * self.average_n + total_batch_sar_squeeze
+        new_average_sar_squeeze = new_total_sar_squeeze / new_total_n
+        self.average_sar_squeeze = nn.Parameter(new_average_sar_squeeze)
 
-        if self.average_n == 0:
-            self.average_sar_squeeze = torch.mean(sar_squeeze, dim=0).unsqueeze(0)
-            self.average_optical_squeeze = torch.mean(optical_squeeze, dim=0).unsqueeze(0)
-            self.average_n += n_batch
-        else:
-            total_batch_sar_squeeze = torch.sum(sar_squeeze, dim=0).unsqueeze(0)
-            self.average_sar_squeeze = (self.average_sar_squeeze * self.average_n + total_batch_sar_squeeze) /\
-                                       (self.average_n + n_batch)
-            total_batch_optical_squeeze = torch.sum(optical_squeeze, dim=0).unsqueeze(0)
-            self.average_optical_squeeze = (self.average_optical_squeeze * self.average_n +
-                                            total_batch_optical_squeeze) / (self.average_n + n_batch)
+        optical_tview = optical.detach().view(optical.shape[:2] + (-1,))
+        optical_squeeze = torch.mean(optical_tview, dim=-1)
+        total_batch_optical_squeeze = torch.sum(optical_squeeze, dim=0).unsqueeze(0)
+        new_total_optical_squeeze = self.average_optical_squeeze * self.average_n + total_batch_optical_squeeze
+        new_average_optical_squeeze = new_total_optical_squeeze / new_total_n
+        self.average_optical_squeeze = nn.Parameter(new_average_optical_squeeze)
+
+    def reset_average_squeeze(self):
+        self.average_sar_squeeze = nn.Parameter(torch.zeros((1, self.dim_sar), requires_grad=False))
+        self.average_optical_squeeze = nn.Parameter(torch.zeros((1, self.dim_optical), requires_grad=False))
+        self.average_n = 0
 
     def set_mode(self, new_mode: str):
         self.mode = new_mode

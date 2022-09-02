@@ -4,10 +4,12 @@ import sys
 
 
 class MultiThresholdMetric(object):
-    def __init__(self, threshold):
+    def __init__(self, threshold, name: str = None):
 
         self._thresholds = threshold[ :, None, None, None, None] # [Tresh, B, C, H, W]
         self._data_dims = (-1, -2, -3, -4) # For a B/W image, it should be [Thresh, B, C, H, W],
+
+        self.name = name
 
         self.TP = 0
         self.TN = 0
@@ -58,6 +60,95 @@ class MultiThresholdMetric(object):
     def compute_f1(self):
         denom = (self.precision + self.recall).clamp(10e-05)
         return 2 * self.precision * self.recall / denom
+
+
+class ConditionalUtilizationRate(object):
+    def __init__(self, threshold: float = 0.5):
+        self.threshold = threshold
+        self.epsilon = 10e-05
+
+        self.data = {
+            'multimodal': {
+                'sar': {
+                    'TP': 0,
+                    'TN': 0,
+                    'FP': 0,
+                    'FN': 0,
+                },
+                'optical': {
+                    'TP': 0,
+                    'TN': 0,
+                    'FP': 0,
+                    'FN': 0,
+                },
+                'fusion': {
+                    'TP': 0,
+                    'TN': 0,
+                    'FP': 0,
+                    'FN': 0,
+                },
+            },
+            'unimodal': {
+                'sar': {
+                    'TP': 0,
+                    'TN': 0,
+                    'FP': 0,
+                    'FN': 0,
+                },
+                'optical': {
+
+                }
+            }
+        }
+
+    def add_sample(self, y_true: torch.Tensor, y_pred: torch.Tensor, mode: str, modality: str):
+        y_true = y_true.bool().flatten()
+        y_pred = (y_pred > self.threshold).flatten()
+        self.data[mode][modality]['TP'] += torch.sum((y_true & y_pred)).float()
+        self.data[mode][modality]['TN'] += torch.sum((~y_true & ~y_pred)).float()
+        self.data[mode][modality]['FP'] += torch.sum((~y_true & y_pred)).float()
+        self.data[mode][modality]['FN'] += torch.sum((y_true & ~y_pred)).float()
+
+
+    def get_true_positives(self, mode: str, modality: str):
+        return self.data[mode][modality]['TP']
+
+    def get_false_positives(self, mode: str, modality: str):
+        return self.data[mode][modality]['FP']
+
+    def get_false_negatives(self, mode: str, modality: str):
+        return self.data[mode][modality]['FN']
+
+    def get_precision(self, mode: str, modality: str) -> float:
+        tp = self.get_true_positives(mode, modality)
+        fp = self.get_false_positives(mode, modality)
+        denom = (tp + fp) + self.epsilon
+        return tp / denom
+
+    def get_recall(self, mode: str, modality: str):
+        tp = self.get_true_positives(mode, modality)
+        fn = self.get_false_negatives(mode, modality)
+        denom = (tp + fn) + self.epsilon
+        return tp / denom
+
+    def compute_f1(self, mode: str, modality: str):
+        precision = self.get_precision(mode, modality)
+        recall = self.get_recall(mode, modality)
+        denom = precision + recall + self.epsilon
+        return 2 * precision * recall / denom
+
+    def get_conditional_utilization_rates(self):
+        # for sar
+        f1_score_mm_optical = self.compute_f1('multimodal', 'optical')
+        f1_score_um_optical = self.compute_f1('unimodal', 'optical')
+        cur_sar = (f1_score_mm_optical - f1_score_um_optical) / f1_score_mm_optical
+
+        # for optical
+        f1_score_mm_sar = self.compute_f1('multimodal', 'sar')
+        f1_score_um_sar = self.compute_f1('unimodal', 'sar')
+        cur_optical = (f1_score_mm_sar - f1_score_um_sar) / f1_score_mm_sar
+
+        return cur_sar, cur_optical
 
 
 def true_pos(y_true: torch.Tensor, y_pred: torch.Tensor, dim=0):
