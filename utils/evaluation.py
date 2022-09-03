@@ -1,20 +1,15 @@
 import torch
 from torch.utils import data as torch_data
-import numpy as np
 import wandb
 from utils import datasets, metrics, experiment_manager
 
 
 def model_evaluation(net, cfg: experiment_manager.CfgNode, device: str, run_type: str, epoch: float, step: int,
-                     max_samples: int = None):
+                     include_unimodal: bool = False, max_samples: int = None):
     net.to(device)
     net.eval()
 
-    thresholds = torch.linspace(0.5, 1, 1).to(device)
-    measurer_sar = metrics.MultiThresholdMetric(thresholds)
-    measurer_optical = metrics.MultiThresholdMetric(thresholds)
-    measurer_fusion = metrics.MultiThresholdMetric(thresholds)
-
+    measurer = metrics.Measurer()
     dataset = datasets.UrbanExtractionDataset(cfg=cfg, dataset=run_type, no_augmentations=True)
 
     # reset the generators
@@ -28,55 +23,63 @@ def model_evaluation(net, cfg: experiment_manager.CfgNode, device: str, run_type
             if step == stop_step:
                 break
 
+            y = batch['y'].to(device)
             x_sar = batch['x_sar'].to(device)
             x_optical = batch['x_optical'].to(device)
-            y_true = batch['y'].to(device)
 
+            net.set_mmtm_mode('fusion')
             logits_sar, logits_optical = net(x_sar, x_optical)
-            y_pred_sar, y_pred_optical = torch.sigmoid(logits_sar), torch.sigmoid(logits_optical)
+            pred_sar, pred_optical = torch.sigmoid(logits_sar).detach(), torch.sigmoid(logits_optical).detach()
+            measurer.add_sample(y, pred_sar, 'multimodal', 'sar')
+            measurer.add_sample(y, pred_optical, 'multimodal', 'optical')
+            pred_fusion = (pred_sar + pred_optical) / 2
+            measurer.add_sample(y, pred_fusion, 'multimodal', 'fusion')
 
-            y_true = y_true.detach()
-            y_pred_sar, y_pred_optical = y_pred_sar.detach(), y_pred_optical.detach()
-            measurer_sar.add_sample(y_true, y_pred_sar)
-            measurer_optical.add_sample(y_true, y_pred_optical)
-            y_pred_fusion = (y_pred_sar + y_pred_optical) / 2
-            measurer_fusion.add_sample(y_true, y_pred_fusion)
+            if include_unimodal:
+                net.set_mmtm_mode('sar')
+                out_sar_um, _ = net.forward(x_sar, x_optical)
+                pred_sar_um = torch.sigmoid(out_sar_um).detach()
+                measurer.add_sample(y, pred_sar_um, 'unimodal', 'sar')
+
+                net.set_mmtm_mode('optical')
+                out_optical_um, _ = net.forward(x_sar, x_optical)
+                pred_optical_um = torch.sigmoid(out_optical_um).detach()
+                measurer.add_sample(y, pred_optical_um, 'unimodal', 'optical')
 
             if cfg.DEBUG:
                 break
 
     print(f'Computing {run_type} F1 score ', end=' ', flush=True)
 
-    for measurer, name in zip([measurer_sar, measurer_optical, measurer_fusion], ['sar', 'optical', 'fusion']):
-        f1s = measurer.compute_f1()
-        precisions, recalls = measurer.precision, measurer.recall
+    modes = ['multimodal', 'unimodal'] if include_unimodal else ['multimodal']
+    for mode in modes:
+        for modality in ['sar', 'optical', 'fusion']:
+            if mode == 'unimodal' and modality == 'fusion':
+                continue
+            f1 = measurer.compute_f1(mode, modality)
+            precision = measurer.compute_precision(mode, modality)
+            recall = measurer.compute_recall(mode, modality)
 
-        # best f1 score for passed thresholds
-        f1 = f1s.max()
-        argmax_f1 = f1s.argmax()
+            wandb.log({f'{run_type} {mode} {modality} F1': f1.item(),
+                       f'{run_type} {mode} {modality} precision': precision.item(),
+                       f'{run_type} {mode} {modality} recall': recall.item(),
+                       'step': step, 'epoch': epoch,
+                       })
 
-        precision = precisions[argmax_f1]
-        recall = recalls[argmax_f1]
-
-        wandb.log({f'{run_type} {name} F1': f1,
-                   f'{run_type} {name} precision': precision,
-                   f'{run_type} {name} recall': recall,
+    if include_unimodal:
+        cur_sar, cur_optical = measurer.compute_conditional_utilization_rates()
+        wandb.log({f'{run_type} CUR sar F1': cur_sar.item(),
+                   f'{run_type} CUR optical F1': cur_optical.item(),
                    'step': step, 'epoch': epoch,
                    })
 
 
-def model_testing(net, cfg: experiment_manager.CfgNode, device: str, step: int, epoch: float):
+def model_testing(net, cfg: experiment_manager.CfgNode, device: str, step: int, epoch: float,
+                  include_unimodal: bool = False):
     net.to(device)
     net.eval()
 
-    thresholds = torch.linspace(0.5, 1, 1).to(device)
-    measurer = metrics.ConditionalUtilizationRate()
-    measurer_fusion = metrics.MultiThresholdMetric(thresholds, 'fusion')
-    measurer_sar_mm = metrics.MultiThresholdMetric(thresholds, 'sar_mm')
-    measurer_sar_um = metrics.MultiThresholdMetric(thresholds, 'sar_um')
-    measurer_optical_mm = metrics.MultiThresholdMetric(thresholds, 'optical_mm')
-    measurer_optical_um = metrics.MultiThresholdMetric(thresholds, 'optical_um')
-
+    measurer = metrics.Measurer()
     dataset = datasets.SpaceNet7Dataset(cfg)
 
     with torch.no_grad():
@@ -86,40 +89,47 @@ def model_testing(net, cfg: experiment_manager.CfgNode, device: str, step: int, 
             x_optical = item['x_optical'].to(device).unsqueeze(0)
 
             net.set_mmtm_mode('fusion')
-            out_sar_mm, out_optical_mm = net.forward(x_sar, x_optical)
-            pred_sar_mm, pred_optical_mm = torch.sigmoid(out_sar_mm).detach(), torch.sigmoid(out_optical_mm).detach()
-            measurer_sar_mm.add_sample(y, pred_sar_mm)
-            measurer_optical_mm.add_sample(y, pred_optical_mm)
+            logits_sar_mm, logits_optical_mm = net.forward(x_sar, x_optical)
+            pred_sar_mm, pred_optical_mm = torch.sigmoid(logits_sar_mm).detach(), torch.sigmoid(logits_optical_mm).detach()
+            measurer.add_sample(y, pred_sar_mm, 'multimodal', 'sar')
+            measurer.add_sample(y, pred_sar_mm, 'multimodal', 'optical')
 
             pred_fusion = (pred_sar_mm + pred_optical_mm) / 2
-            measurer_fusion.add_sample(y, pred_fusion)
+            measurer.add_sample(y, pred_fusion, 'multimodal', 'fusion')
 
-            net.set_mmtm_mode('sar')
-            out_sar_um, _ = net.forward(x_sar, x_optical)
-            pred_sar_um = torch.sigmoid(out_sar_um).detach()
-            measurer_sar_um.add_sample(y, pred_sar_um)
+            if include_unimodal:
+                net.set_mmtm_mode('sar')
+                logits_sar_um, _ = net.forward(x_sar, x_optical)
+                pred_sar_um = torch.sigmoid(logits_sar_um).detach()
+                measurer.add_sample(y, pred_sar_um, 'unimodal', 'sar')
 
-            net.set_mmtm_mode('optical')
-            out_optical_um, _ = net.forward(x_sar, x_optical)
-            pred_optical_um = torch.sigmoid(out_optical_um).detach()
-            measurer_optical_um.add_sample(y, pred_optical_um)
+                net.set_mmtm_mode('optical')
+                logits_optical_um, _ = net.forward(x_sar, x_optical)
+                pred_optical_um = torch.sigmoid(logits_optical_um).detach()
+                measurer.add_sample(y, pred_optical_um, 'unimodal', 'optical')
 
-        for measurer in [measurer_sar_mm, measurer_sar_um, measurer_optical_mm, measurer_optical_um, measurer_fusion]:
-            f1s = measurer.compute_f1()
-            precisions, recalls = measurer.precision, measurer.recall
+    modes = ['multimodal', 'unimodal'] if include_unimodal else ['multimodal']
+    for mode in modes:
+        for modality in ['sar', 'optical', 'fusion']:
+            if mode == 'unimodal' and modality == 'fusion':
+                continue
 
-            # best f1 score for passed thresholds
-            f1 = f1s.max()
-            argmax_f1 = f1s.argmax()
+            f1 = measurer.compute_f1(mode, modality)
+            precision = measurer.compute_precision(mode, modality)
+            recall = measurer.compute_recall(mode, modality)
 
-            precision = precisions[argmax_f1]
-            recall = recalls[argmax_f1]
-
-            wandb.log({f'test {measurer.name} F1': f1.item(),
-                       f'test {measurer.name} precision': precision.item(),
-                       f'test {measurer.name} recall': recall.item(),
+            wandb.log({f'test {mode} {modality} F1': f1.item(),
+                       f'test {mode} {modality} precision': precision.item(),
+                       f'test {mode} {modality} recall': recall.item(),
                        'step': step, 'epoch': epoch,
                        })
+
+    if include_unimodal:
+        cur_sar, cur_optical = measurer.compute_conditional_utilization_rates()
+        wandb.log({f'test CUR sar F1': cur_sar.item(),
+                   f'test CUR optical F1': cur_optical.item(),
+                   'step': step, 'epoch': epoch,
+                   })
 
 
 def compute_mmtm_features(net, cfg: experiment_manager.CfgNode, device: str, run_type: str):

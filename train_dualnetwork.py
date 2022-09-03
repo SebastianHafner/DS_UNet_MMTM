@@ -64,6 +64,7 @@ def run_training(cfg):
         for i, batch in enumerate(dataloader):
 
             net.train()
+            net.set_mmtm_mode('fusion')
             optimizer.zero_grad()
 
             x_sar = batch['x_sar'].to(device)
@@ -108,7 +109,9 @@ def run_training(cfg):
                 sar_loss_set, optical_loss_set, loss_set = [], [], []
 
             if cfg.DEBUG:
+                evaluation.model_testing(net, cfg, device, global_step, epoch_float, include_unimodal=True)
                 break
+
             # end of batch
 
         if not cfg.DEBUG:
@@ -118,15 +121,12 @@ def run_training(cfg):
             # computing average squeeze features for MMTM modules based on the training set
             evaluation.compute_mmtm_features(net, cfg, device, 'training')
 
-            evaluation.model_testing(net, cfg, device, global_step, epoch_float)
-            evaluation.model_testing_cur(net, cfg, device, global_step, epoch_float)
-
             print(f'saving network', flush=True)
             networks.save_checkpoint(net, optimizer, epoch, global_step, cfg)
 
-            # logs to load network
-            evaluation.model_evaluation(net, cfg, device, 'training', epoch_float, global_step)
-            evaluation.model_evaluation(net, cfg, device, 'validation', epoch_float, global_step)
+            evaluation.model_testing(net, cfg, device, global_step, epoch_float, include_unimodal=True)
+            evaluation.model_evaluation(net, cfg, device, 'training', epoch_float, global_step, include_unimodal=True)
+            evaluation.model_evaluation(net, cfg, device, 'validation', epoch_float, global_step, include_unimodal=True)
             net.reset_mmtm_features()
 
 
