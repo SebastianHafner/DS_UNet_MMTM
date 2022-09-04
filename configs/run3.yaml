@@ -2,4 +2,4 @@ _BASE_: "base.yaml"
 DEBUG: False
 
 TRAINER:
-  LR: 1e-3.246
+  LR: 5.67e-4
