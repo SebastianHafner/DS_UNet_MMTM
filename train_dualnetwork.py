@@ -117,17 +117,17 @@ def run_training(cfg):
         if not cfg.DEBUG:
             assert (epoch == epoch_float)
 
-        if epoch in save_checkpoints and not cfg.DEBUG:
-            # computing average squeeze features for MMTM modules based on the training set
-            evaluation.compute_mmtm_features(net, cfg, device, 'training')
+        # computing average squeeze features for MMTM modules based on the training set
+        evaluation.compute_mmtm_features(net, cfg, device, 'training')
+        evaluation.model_testing(net, cfg, device, global_step, epoch_float, include_unimodal=True)
+        evaluation.model_evaluation(net, cfg, device, 'training', epoch_float, global_step, include_unimodal=True)
+        evaluation.model_evaluation(net, cfg, device, 'validation', epoch_float, global_step, include_unimodal=True)
 
+        if epoch in save_checkpoints and not cfg.DEBUG:
             print(f'saving network', flush=True)
             networks.save_checkpoint(net, optimizer, epoch, global_step, cfg)
 
-            evaluation.model_testing(net, cfg, device, global_step, epoch_float, include_unimodal=True)
-            evaluation.model_evaluation(net, cfg, device, 'training', epoch_float, global_step, include_unimodal=True)
-            evaluation.model_evaluation(net, cfg, device, 'validation', epoch_float, global_step, include_unimodal=True)
-            net.reset_mmtm_features()
+        net.reset_mmtm_features()
 
 
 if __name__ == '__main__':

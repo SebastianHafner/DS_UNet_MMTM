@@ -68,8 +68,10 @@ def model_evaluation(net, cfg: experiment_manager.CfgNode, device: str, run_type
 
     if include_unimodal:
         cur_sar, cur_optical = measurer.compute_conditional_utilization_rates()
+        dutil = cur_optical - cur_sar
         wandb.log({f'{run_type} CUR sar F1': cur_sar.item(),
                    f'{run_type} CUR optical F1': cur_optical.item(),
+                   f'{run_type} dutil F1': dutil.item(),
                    'step': step, 'epoch': epoch,
                    })
 
@@ -126,8 +128,10 @@ def model_testing(net, cfg: experiment_manager.CfgNode, device: str, step: int, 
 
     if include_unimodal:
         cur_sar, cur_optical = measurer.compute_conditional_utilization_rates()
+        dutil = cur_optical - cur_sar
         wandb.log({f'test CUR sar F1': cur_sar.item(),
                    f'test CUR optical F1': cur_optical.item(),
+                   f'test dutil F1': dutil.item(),
                    'step': step, 'epoch': epoch,
                    })
 
